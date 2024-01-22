@@ -83,6 +83,9 @@ func main() {
 	v1.Post("/feeds", ac.middlewareAuth(func(w http.ResponseWriter, r *http.Request, u database.User) {
 		handleFeedsPost(w, r, u, ac)
 	}))
+  v1.Get("/feeds", func(w http.ResponseWriter, r *http.Request) {
+    handleFeedsGet(w, r, ac)
+  })
 	r.Mount("/v1", v1)
 
 	s := http.Server{
@@ -168,4 +171,13 @@ func handleFeedsPost(w http.ResponseWriter, r *http.Request, u database.User, ac
     return
   }
   respondWithJSON(w, http.StatusOK, newFeed)
+}
+
+func handleFeedsGet(w http.ResponseWriter, r *http.Request, ac apiConfig) {
+  feeds, err := ac.DB.ListFeeds(r.Context())
+  if err != nil {
+    respondWithError(w, http.StatusInternalServerError, "Unable to retrieve feeds")
+    return
+  }
+  respondWithJSON(w, http.StatusOK, feeds)
 }
