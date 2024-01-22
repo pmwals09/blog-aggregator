@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -19,8 +18,32 @@ import (
 	"github.com/pmwals09/rss-aggregator/internal/database"
 )
 
+type authedHandler func(http.ResponseWriter, *http.Request, database.User)
 type apiConfig struct {
 	DB *database.Queries
+}
+
+func (ac *apiConfig) middlewareAuth(next authedHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authorization := r.Header.Get("Authorization")
+		if authorization == "" {
+			respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+			return
+		}
+		fields := strings.Fields(authorization)
+		name, key := fields[0], fields[1]
+		if name != "ApiKey" {
+			respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+			return
+		}
+		user, err := ac.DB.GetUserByApiKey(r.Context(), key)
+		if err != nil {
+			respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+			return
+		}
+
+		next(w, r, user)
+	}
 }
 
 func main() {
@@ -54,12 +77,12 @@ func main() {
 		respondWithError(w, http.StatusInternalServerError, "Internal Server Error")
 	})
 	v1.Post("/users", func(w http.ResponseWriter, r *http.Request) {
-    handleUsersPost(w, r, ac)
+		handleUsersPost(w, r, ac)
 	})
-
-	v1.Get("/users", func(w http.ResponseWriter, r *http.Request) {
-    handleUsersGet(w, r, ac)
-  })
+	v1.Get("/users", ac.middlewareAuth(handleUsersGet))
+	v1.Post("/feeds", ac.middlewareAuth(func(w http.ResponseWriter, r *http.Request, u database.User) {
+		handleFeedsPost(w, r, u, ac)
+	}))
 	r.Mount("/v1", v1)
 
 	s := http.Server{
@@ -103,7 +126,7 @@ func handleUsersPost(w http.ResponseWriter, r *http.Request, ac apiConfig) {
 		UpdatedAt: time.Now(),
 		Name:      newUsersReq.Name,
 	}
-	newUser, err := ac.DB.CreateUser(context.Background(), user)
+	newUser, err := ac.DB.CreateUser(r.Context(), user)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error creating user")
 		fmt.Println(err)
@@ -112,22 +135,37 @@ func handleUsersPost(w http.ResponseWriter, r *http.Request, ac apiConfig) {
 	respondWithJSON(w, http.StatusCreated, newUser)
 }
 
-func handleUsersGet(w http.ResponseWriter, r *http.Request, ac apiConfig) {
-  authorization := r.Header.Get("Authorization")
-  if authorization == "" {
-    respondWithError(w, http.StatusUnauthorized, "Unauthorized")
-    return
-  }
-  fields := strings.Fields(authorization)
-  name, key := fields[0], fields[1]
-  if name != "ApiKey" {
-    respondWithError(w, http.StatusUnauthorized, "Unauthorized")
-    return
-  }
-  user, err := ac.DB.GetUserByApiKey(context.Background(), key)
+func handleUsersGet(w http.ResponseWriter, r *http.Request, u database.User) {
+	respondWithJSON(w, http.StatusOK, u)
+	return
+}
+
+func handleFeedsPost(w http.ResponseWriter, r *http.Request, u database.User, ac apiConfig) {
+	type feedsPostRequest struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	defer r.Body.Close()
+	newFeedsPostRequest := feedsPostRequest{}
+  err := decoder.Decode(&newFeedsPostRequest)
   if err != nil {
-    respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+    respondWithError(w, http.StatusBadRequest, "Unable to decode json")
     return
   }
-  respondWithJSON(w, http.StatusOK, user)
+	newFeed, err := ac.DB.CreateFeed(
+		r.Context(),
+		database.CreateFeedParams{
+			ID:        uuid.New(),
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+			Name:      newFeedsPostRequest.Name,
+			Url:       newFeedsPostRequest.URL,
+			UserID:    u.ID,
+		})
+  if err != nil {
+    respondWithError(w, http.StatusInternalServerError, "Unable to save feed")
+    return
+  }
+  respondWithJSON(w, http.StatusOK, newFeed)
 }
