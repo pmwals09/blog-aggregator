@@ -83,9 +83,18 @@ func main() {
 	v1.Post("/feeds", ac.middlewareAuth(func(w http.ResponseWriter, r *http.Request, u database.User) {
 		handleFeedsPost(w, r, u, ac)
 	}))
-  v1.Get("/feeds", func(w http.ResponseWriter, r *http.Request) {
-    handleFeedsGet(w, r, ac)
-  })
+	v1.Get("/feeds", func(w http.ResponseWriter, r *http.Request) {
+		handleFeedsGet(w, r, ac)
+	})
+	v1.Post("/feed_follows", ac.middlewareAuth(func(w http.ResponseWriter, r *http.Request, u database.User) {
+		handleFollowsPost(w, r, u, ac)
+	}))
+	v1.Delete("/feed_follows/{feedFollowID}", ac.middlewareAuth(func(w http.ResponseWriter, r *http.Request, u database.User) {
+		handleFollowsDelete(w, r, u, ac)
+	}))
+	v1.Get("/feed_follows", ac.middlewareAuth(func(w http.ResponseWriter, r *http.Request, u database.User) {
+		handleFollowsGet(w, r, u, ac)
+	}))
 	r.Mount("/v1", v1)
 
 	s := http.Server{
@@ -151,11 +160,11 @@ func handleFeedsPost(w http.ResponseWriter, r *http.Request, u database.User, ac
 	decoder := json.NewDecoder(r.Body)
 	defer r.Body.Close()
 	newFeedsPostRequest := feedsPostRequest{}
-  err := decoder.Decode(&newFeedsPostRequest)
-  if err != nil {
-    respondWithError(w, http.StatusBadRequest, "Unable to decode json")
-    return
-  }
+	err := decoder.Decode(&newFeedsPostRequest)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Unable to decode json")
+		return
+	}
 	newFeed, err := ac.DB.CreateFeed(
 		r.Context(),
 		database.CreateFeedParams{
@@ -166,18 +175,108 @@ func handleFeedsPost(w http.ResponseWriter, r *http.Request, u database.User, ac
 			Url:       newFeedsPostRequest.URL,
 			UserID:    u.ID,
 		})
-  if err != nil {
-    respondWithError(w, http.StatusInternalServerError, "Unable to save feed")
-    return
-  }
-  respondWithJSON(w, http.StatusOK, newFeed)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to save feed")
+		return
+	}
+	newFeedFollow, err := ac.DB.CreateFeedFollow(
+		r.Context(),
+		database.CreateFeedFollowParams{
+			ID:        uuid.New(),
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+			UserID:    u.ID,
+			FeedID:    newFeed.ID,
+		})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to save feed follow")
+		return
+	}
+	type createFeedResponse struct {
+		Feed       database.Feed       `json:"feed"`
+		FeedFollow database.FeedFollow `json:"feed_follow"`
+	}
+	respondWithJSON(w, http.StatusOK, createFeedResponse{
+		Feed:       newFeed,
+		FeedFollow: newFeedFollow,
+	})
 }
 
 func handleFeedsGet(w http.ResponseWriter, r *http.Request, ac apiConfig) {
-  feeds, err := ac.DB.ListFeeds(r.Context())
-  if err != nil {
-    respondWithError(w, http.StatusInternalServerError, "Unable to retrieve feeds")
-    return
-  }
-  respondWithJSON(w, http.StatusOK, feeds)
+	feeds, err := ac.DB.ListFeeds(r.Context())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to retrieve feeds")
+		return
+	}
+	respondWithJSON(w, http.StatusOK, feeds)
+}
+
+func handleFollowsPost(w http.ResponseWriter, r *http.Request, u database.User, ac apiConfig) {
+	type followsPostRequest struct {
+		FeedId string `json:"feed_id"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	defer r.Body.Close()
+	req := followsPostRequest{}
+	err := decoder.Decode(&req)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Unable to decode json")
+		return
+	}
+
+	if req.FeedId == "" {
+		respondWithError(w, http.StatusBadRequest, "Invalid feed ID")
+		return
+	}
+
+	newFeedId, err := uuid.Parse(req.FeedId)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid feed ID")
+		return
+	}
+	params := database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID:    u.ID,
+		FeedID:    newFeedId,
+	}
+	follow, err := ac.DB.CreateFeedFollow(r.Context(), params)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+	respondWithJSON(w, http.StatusOK, follow)
+	return
+}
+
+func handleFollowsDelete(w http.ResponseWriter, r *http.Request, u database.User, ac apiConfig) {
+	feedFollowID := chi.URLParam(r, "feedFollowID")
+	if feedFollowID == "" {
+		respondWithError(w, http.StatusBadRequest, "Bad path")
+		return
+	}
+
+	feedFollowUUID, err := uuid.Parse(feedFollowID)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Bad path")
+		return
+	}
+	err = ac.DB.DeleteFeedFollow(r.Context(), feedFollowUUID)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Problem deleting feed")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return
+}
+
+func handleFollowsGet(w http.ResponseWriter, r *http.Request, u database.User, ac apiConfig) {
+	feedFollows, err := ac.DB.GetUserFeedFollows(r.Context(), u.ID)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to retrieve follows")
+		return
+	}
+	respondWithJSON(w, http.StatusOK, feedFollows)
+	return
 }
