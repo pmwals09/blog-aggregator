@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -21,6 +25,34 @@ import (
 type authedHandler func(http.ResponseWriter, *http.Request, database.User)
 type apiConfig struct {
 	DB *database.Queries
+}
+type feedData struct {
+	XMLName xml.Name `xml:"rss"`
+	Text    string   `xml:",chardata"`
+	Version string   `xml:"version,attr"`
+	Atom    string   `xml:"atom,attr"`
+	Channel struct {
+		Text  string `xml:",chardata"`
+		Title string `xml:"title"`
+		Link  struct {
+			Text string `xml:",chardata"`
+			Href string `xml:"href,attr"`
+			Rel  string `xml:"rel,attr"`
+			Type string `xml:"type,attr"`
+		} `xml:"link"`
+		Description   string `xml:"description"`
+		Generator     string `xml:"generator"`
+		Language      string `xml:"language"`
+		LastBuildDate string `xml:"lastBuildDate"`
+		Item          []struct {
+			Text        string `xml:",chardata"`
+			Title       string `xml:"title"`
+			Link        string `xml:"link"`
+			PubDate     string `xml:"pubDate"`
+			Guid        string `xml:"guid"`
+			Description string `xml:"description"`
+		} `xml:"item"`
+	} `xml:"channel"`
 }
 
 func (ac *apiConfig) middlewareAuth(next authedHandler) http.HandlerFunc {
@@ -66,6 +98,8 @@ func main() {
 	dbQueries := database.New(db)
 
 	ac := apiConfig{dbQueries}
+
+	go getFeedsWorker(ac)
 
 	r := chi.NewRouter()
 	r.Use(cors.Handler(cors.Options{}))
@@ -279,4 +313,41 @@ func handleFollowsGet(w http.ResponseWriter, r *http.Request, u database.User, a
 	}
 	respondWithJSON(w, http.StatusOK, feedFollows)
 	return
+}
+
+func getFeed(url string, wg *sync.WaitGroup) (feedData, error) {
+	defer wg.Done()
+	fd := feedData{}
+	res, err := http.Get(url)
+	if err != nil {
+		fmt.Println(err)
+		return fd, err
+	}
+	body, err := io.ReadAll(res.Body)
+	defer res.Body.Close()
+	err = xml.Unmarshal(body, &fd)
+	if err != nil {
+		return fd, err
+	}
+	fmt.Println(fd.Channel.Title)
+	return fd, nil
+}
+
+func getFeedsWorker(ac apiConfig) {
+	fmt.Println("Starting feeds worker...")
+	for range time.Tick(time.Minute) {
+		feeds, err := ac.DB.GetNextFeedsToFetch(context.Background(), 10)
+		if err != nil {
+			fmt.Println("Could not get next feeds: ", err)
+			break
+		}
+		fmt.Println("Processing latest batch of feeds...")
+		wg := sync.WaitGroup{}
+		for _, feed := range feeds {
+			wg.Add(1)
+			fmt.Printf("Processing %s feed\n", feed.Name)
+			go getFeed(feed.Url, &wg)
+		}
+		wg.Wait()
+	}
 }
