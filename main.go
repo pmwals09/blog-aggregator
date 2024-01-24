@@ -53,6 +53,7 @@ type feedData struct {
 			Description string `xml:"description"`
 		} `xml:"item"`
 	} `xml:"channel"`
+	FeedID uuid.UUID `xml:"feed_id"`
 }
 
 func (ac *apiConfig) middlewareAuth(next authedHandler) http.HandlerFunc {
@@ -128,6 +129,9 @@ func main() {
 	}))
 	v1.Get("/feed_follows", ac.middlewareAuth(func(w http.ResponseWriter, r *http.Request, u database.User) {
 		handleFollowsGet(w, r, u, ac)
+	}))
+	v1.Get("/posts", ac.middlewareAuth(func(w http.ResponseWriter, r *http.Request, u database.User) {
+		handlePostsGet(w, r, u, ac)
 	}))
 	r.Mount("/v1", v1)
 
@@ -315,8 +319,57 @@ func handleFollowsGet(w http.ResponseWriter, r *http.Request, u database.User, a
 	return
 }
 
-func getFeed(url string, wg *sync.WaitGroup) (feedData, error) {
-	defer wg.Done()
+func handlePostsGet(w http.ResponseWriter, r *http.Request, u database.User, ac apiConfig) {
+	getPostArgs := database.GetPostsByUserParams{
+		UserID: u.ID,
+		Limit:  10,
+	}
+	posts, err := ac.DB.GetPostsByUser(r.Context(), getPostArgs)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "There was a problem getting the user's posts")
+		return
+	}
+	type response struct {
+		ID          uuid.UUID
+		CreatedAt   time.Time
+		UpdatedAt   time.Time
+		Title       string
+		Url         string
+		Description *string
+		PublishedAt *time.Time
+		FeedID      uuid.UUID
+		UserID      uuid.UUID
+	}
+	responses := make([]response, 0, len(posts))
+	for _, post := range posts {
+		r := response{
+			ID:        post.ID,
+			CreatedAt: post.CreatedAt,
+			UpdatedAt: post.UpdatedAt,
+			Title:     post.Title,
+			Url:       post.Url,
+			FeedID:    post.FeedID,
+			UserID:    u.ID,
+		}
+
+		if !post.Description.Valid {
+			r.Description = nil
+		} else {
+			r.Description = &post.Description.String
+		}
+		if !post.PublishedAt.Valid {
+			r.PublishedAt = nil
+		} else {
+			r.PublishedAt = &post.PublishedAt.Time
+		}
+
+		responses = append(responses, r)
+	}
+	respondWithJSON(w, http.StatusOK, responses)
+	return
+}
+
+func getFeed(url string) (feedData, error) {
 	fd := feedData{}
 	res, err := http.Get(url)
 	if err != nil {
@@ -335,6 +388,9 @@ func getFeed(url string, wg *sync.WaitGroup) (feedData, error) {
 
 func getFeedsWorker(ac apiConfig) {
 	fmt.Println("Starting feeds worker...")
+	errorChan := make(chan error)
+	feedChan := make(chan feedData)
+	done := make(chan struct{})
 	for range time.Tick(time.Minute) {
 		feeds, err := ac.DB.GetNextFeedsToFetch(context.Background(), 10)
 		if err != nil {
@@ -346,8 +402,53 @@ func getFeedsWorker(ac apiConfig) {
 		for _, feed := range feeds {
 			wg.Add(1)
 			fmt.Printf("Processing %s feed\n", feed.Name)
-			go getFeed(feed.Url, &wg)
+			go func(f database.Feed) {
+				defer wg.Done()
+				feedData, err := getFeed(f.Url)
+				feedData.FeedID = feed.ID
+				if err != nil {
+					errorChan <- err
+				}
+				feedChan <- feedData
+			}(feed)
 		}
-		wg.Wait()
+		go func() {
+			wg.Wait()
+			done <- struct{}{}
+		}()
+
+		select {
+		case err := <-errorChan:
+			fmt.Println(err)
+		case feed := <-feedChan:
+			for _, item := range feed.Channel.Item {
+				fmt.Printf("Adding %s to posts...\n", item.Title)
+				createParams := database.CreatePostParams{
+					ID:        uuid.New(),
+					CreatedAt: time.Now(),
+					UpdatedAt: time.Now(),
+					Title:     item.Title,
+					Url:       item.Link,
+					FeedID:    feed.FeedID,
+				}
+				if item.Description != "" {
+					createParams.Description = sql.NullString{String: item.Description, Valid: true}
+				}
+				createParams.Description = sql.NullString{String: "", Valid: false}
+
+				if item.PubDate == "" {
+					createParams.PublishedAt = sql.NullTime{Time: time.Now(), Valid: false}
+				}
+				pubTime, err := time.Parse(time.RFC1123Z, item.PubDate)
+				if err != nil {
+					createParams.PublishedAt = sql.NullTime{Time: time.Now(), Valid: false}
+				}
+				createParams.PublishedAt = sql.NullTime{Time: pubTime, Valid: true}
+
+				ac.DB.CreatePost(context.Background(), createParams)
+			}
+		case <-done:
+			break
+		}
 	}
 }
